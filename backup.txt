@@ -1,0 +1,67 @@
+i32 DirectoryEnum(
+  const tchar*          path,
+  const tchar*          mask,
+  DirectoryEnumCallback callback,
+  void*                 ctx
+) {
+  i32                     err = 0;
+  HANDLE                  hDir;
+  IO_STATUS_BLOCK         ioStatus = { 0 };
+  NTSTATUS                ntStatus;
+  UNICODE_STRING          searchMask;
+  PFILE_NAMES_INFORMATION entry;
+
+  hDir = CreateFileW(
+    path, FILE_LIST_DIRECTORY,
+    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+    OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_SEQUENTIAL_SCAN, NULL
+  );
+  if (hDir == INVALID_HANDLE_VALUE)
+    return GetLastError();
+
+  RtlInitUnicodeString(&searchMask, mask ? mask : L"*");
+
+  BYTE    buf[65536];
+  wchar_t filename[MAX_  bool    first = true;
+  for (;;) {
+    ntStatus = NtQueryDirectoryFile(
+      hDir, NULL, NULL, NULL, &ioStatus, buf, sizeof(buf),
+      FileNamesInformation, false, &searchMask, FALSE, false
+    );
+
+    if (ntStatus == STATUS_NO_MORE_FILES) {
+      break;
+    }
+
+    if (unlikely(NT_ERROR(ntStatus))) {
+      err = RtlNtStatusToDosError(ntStatus);
+      break;
+    }
+
+    if (unlikely(ioStatus.Information == 0)) {
+      err = ERROR_BUFFER_OVERFLOW;
+      break;
+    }
+
+    entry = (PFILE_NAMES_INFORMATION)buf;
+    for (;;) {
+      ULONG n = entry->FileNameLength / sizeof(wchar_t);
+
+      if (!(entry->FileName[0] == L'.'
+            && (n == 1 || (n == 2 && entry->FileName[1] == L'.')))) {
+        memcpy(filename, entry->FileName, n * sizeof(wchar_t));
+        filename[n] = L'\0';
+        if (callback(filename, ctx))
+          goto end;
+      }
+
+      if (entry->NextEntryOffset == 0)
+        break;
+      entry = (PFILE_NAMES_INFORMATION)((BYTE*)entry + entry->NextEntryOffset);
+    }
+  }
+
+end:
+  CloseHandle(hDir);
+  return err;
+}
