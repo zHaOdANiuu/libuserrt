@@ -10,5 +10,5 @@ cdos: cdos.c
 auto-test:
 	$@
 
-fast-test: test.c
-	$(CC) $(CFLAGS) $(LIBS) $< -o $@ && ./$@
+fast-test: test.c libuserrt.c
+	$(CC) $(CFLAGS) $^ $(LIBS) -o $@ && ./$@

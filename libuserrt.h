@@ -114,6 +114,9 @@ extern force_inline FILE* FileOpen(const tchar* path, const tchar* mode);
 extern force_inline bool FileRead(FILE* f, char* buf, u64 chars);
 
 /***/
+extern force_inline bool FileReadLn(FILE* f, char* buf, u64 len);
+
+/***/
 extern force_inline bool FileWrite(FILE* f, tchar* text, u64 len);
 
 /***/
@@ -197,20 +200,36 @@ extern i32 DirectoryEnum(
 
 typedef HANDLE ProcessHandle;
 
+typedef enum {
+  PROC_IO_PENDING = 0,
+  PROC_IO_EOF,
+  PROC_IO_ERROR,
+} ProcessIOStatus;
+
 typedef struct {
+  ProcessHandle   stream;
+  OVERLAPPED      ov;
+  ProcessIOStatus status;
+} ProcessIO;
+
+typedef struct {
+  ProcessIO     io;
   ProcessHandle stdInput;
   ProcessHandle stdOutput;
   ProcessHandle stdError;
   ProcessHandle process;
-  tchar*        command;
 } Process;
 
 /***/
-extern bool ProcessCreate(Process* p);
+extern bool ProcessCreate(Process* p, tchar* command);
 /***/
-extern i32 ProcessRead(ProcessHandle stream, char* buf, u32 size);
+extern bool ProcessRead(Process* p, i32 type, char* buf, u32 size);
 /***/
-extern i32 ProcessWrite(Process* p, const char* str, u32 len);
+extern bool ProcessWrite(Process* p, const char* str, u32 len);
+/***/
+extern u32  ProcessWait(Process* p);
+/***/
+extern force_inline bool ProcessCloseOnly(ProcessHandle h);
 /***/
 extern bool ProcessClose(Process* p);
 /***/

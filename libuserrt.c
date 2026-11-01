@@ -28,10 +28,10 @@
 #error "ERROR"
 #endif
 
+#include <assert.h>
+
 #define LIBUSERRT_KEEP
 #include "libuserrt.h"
-
-#include <assert.h>
 
 
 #ifdef _WIN32
@@ -42,10 +42,6 @@
 #define T(s) s
 #endif
 
-
-#define likely(x) __builtin_expect(!!(x), 1)
-#define unlikely(x) __builtin_expect(!!(x), 0)
-
 #define DIRECTORY_SEP '/'
 #ifdef _WIN32
 #define IS_DEVICE_SEP(_c_) ((_c_) == ':')
@@ -55,6 +51,11 @@
 #define IS_DEVICE_SEP(_c_) ((_c_) == ':')
 #define IS_DIRECTORY_SEP(_c_) ((_c_) == DIRECTORY_SEP)
 #endif
+
+
+#define likely(x) __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+
 
 #ifndef offsetof
 #define offsetof(type, field) ((size_t)&((type*)0)->field)
@@ -138,6 +139,10 @@ FILE* FileOpen(const tchar* path, const tchar* mode) {
 
 bool FileRead(FILE* f, char* buf, u64 chars) {
   return fread(buf, 1, chars, f) == chars;
+}
+
+bool FileReadLn(FILE* f, char* buf, u64 len) {
+  return fgets(buf, len, f) != NULL;
 }
 
 bool FileWrite(FILE* f, tchar* text, u64 len) {
@@ -306,14 +311,16 @@ no_inline i32 FileDialogOpen(
   if (unlikely(FAILED(hr)))
     goto clean1;
 
-  if (isisDirType) {
-    hr = pFileOpen->lpVtblSetOptions(options | FOS_PICKFOLDERS);
+  if (isDirType) {
+    hr = pFileOpen->lpVtbl->SetOptions(pFileOpen, options | FOS_PICKFOLDERS);
     if (unlikely(FAILED(hr)))
       goto clean1;
   }
 
   if (multiSelect) {
-    hr = pFileOpen->lpVtbl->SetOptions(pFileOpen, opt | FOS_ALLOWMULTISELECT);
+    hr = pFileOpen->lpVtbl->SetOptions(
+      pFileOpen, options | FOS_ALLOWMULTISELECT
+    );
     if (unlikely(FAILED(hr)))
       goto clean1;
   }
@@ -452,8 +459,8 @@ static bool makePipe(
 
   static LONG counter = 0;
   tchar       name[256];
-  _stprintf_s(
-    name, _countof(name), _T("\\\\.\\pipe\\anonymous_%lu_%ld"),
+  swprintf(
+    name, sizeof(name) / sizeof(name[0]), T("\\\\.\\pipe\\anonymous_%lu_%ld"),
     GetCurrentProcessId(), InterlockedIncrement(&counter)
   );
 
@@ -482,14 +489,35 @@ static bool makePipe(
   return true;
 }
 
-bool ProcessCreate(Process* p) {
-  if (!p || !p->command || p->command[0] == '\0')
+/*
+ * @test
+ * Process p;
+ * tchar   cmd[] = T("cmd.exe /Q");
+ * assert(ProcessCreate(&p, cmd));
+ *
+ * const char msg[] = "dir\n";
+ * assert(ProcessWrite(&p, msg, sizeof(msg) - 1));
+ * assert(ProcessWait(&p) > 0);
+ * assert(ProcessCloseOnly(p.stdInput));
+ *
+ * char buf[4096];
+ * for (;;) {
+ *   if (!ProcessRead(&p, 0, buf, sizeof(buf)))
+ *     break;
+ *   i32 n = ProcessWait(&p);
+ *   if (n <= 0)
+ *     break;
+ *   fwrite(buf, 1, (size_t)n, stdout);
+ * }
+ *
+ * ProcessKill(&p);
+ * ProcessClose(&p);
+ */
+bool ProcessCreate(Process* p, tchar* command) {
+  if (!command)
     return false;
 
-  p->stdInput  = INVALID_HANDLE_VALUE;
-  p->stdOutput = INVALID_HANDLE_VALUE;
-  p->stdError  = INVALID_HANDLE_VALUE;
-  p->process   = NULL;
+  memset(p, 0, sizeof(*p));
 
   SECURITY_ATTRIBUTES sa  = { 0 };
   sa.nLength              = sizeof(sa);
@@ -508,6 +536,10 @@ bool ProcessCreate(Process* p) {
   if (!makePipe(&hErrRead, &hErrWrite, &sa, 0, false))
     goto clean2;
 
+  SetHandleInformation(hInWrite, HANDLE_FLAG_INHERIT, 0);
+  SetHandleInformation(hOutRead, HANDLE_FLAG_INHERIT, 0);
+  SetHandleInformation(hErrRead, HANDLE_FLAG_INHERIT, 0);
+
   STARTUPINFO si = { 0 };
   si.cb          = sizeof(si);
   si.dwFlags     = STARTF_USESTDHANDLES;
@@ -518,8 +550,7 @@ bool ProcessCreate(Process* p) {
   PROCESS_INFORMATION pi = { 0 };
 
   if (!CreateProcess(
-        NULL, p->command, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si,
-        &pi
+        NULL, command, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi
       ))
     goto clean3;
 
@@ -550,90 +581,150 @@ clean0:
   return false;
 }
 
-i32 ProcessRead(ProcessHandle stream, char* buf, u32 size) {
-  if (stream == INVALID_HANDLE_VALUE || !buf || size == 0)
-    return -1;
+bool ProcessRead(Process* p, i32 type, char* buf, u32 size) {
+  if (!p || !buf || size == 0)
+    return false;
 
-  DWORD      n  = 0;
-  OVERLAPPED ov = { 0 };
+  ProcessHandle stream;
+  switch (type) {
+    case 0:
+      stream = p->stdOutput;
+      break;
+    case 1:
+      stream = p->stdError;
+      break;
+    default:
+      return false;
+  }
+  if (stream == INVALID_HANDLE_VALUE)
+    return false;
 
-  if (!ReadFile(stream, buf, size, &n, &ov)) {
-    DWORD err = GetLastError();
-    if (err == ERROR_IO_PENDING) {
-      if (!GetOverlappedResult(stream, &ov, &n, TRUE)) {
-        err = GetLastError();
-        if (err == ERROR_BROKEN_PIPE || err == ERROR_HANDLE_EOF)
-          return 0;
-        return -1;
-      }
-    } else if (err == ERROR_BROKEN_PIPE || err == ERROR_HANDLE_EOF) {
-      return 0;
-    } else {
-      return -1;
-    }
+  ProcessIO* io = &p->io;
+  io->stream    = stream;
+  io->status    = PROC_IO_PENDING;
+
+  memset(&io->ov, 0, sizeof(io->ov));
+  io->ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+  if (!io->ov.hEvent) {
+    io->status = PROC_IO_ERROR;
+    return false;
   }
 
+  DWORD n = 0;
+  if (ReadFile(stream, buf, size, &n, &io->ov)) {
+    SetEvent(io->ov.hEvent);
+    return true;
+  }
+
+  DWORD err = GetLastError();
+  if (err == ERROR_IO_PENDING)
+    return true;
+
+  CloseHandle(io->ov.hEvent);
+  io->ov.hEvent = NULL;
+  io->status    = (err == ERROR_BROKEN_PIPE || err == ERROR_HANDLE_EOF)
+                    ? PROC_IO_EOF
+                    : PROC_IO_ERROR;
+  return true;
+}
+
+bool ProcessWrite(Process* p, const char* str, u32 len) {
+  if (!p || p->stdInput == INVALID_HANDLE_VALUE || !str || len == 0)
+    return false;
+
+  ProcessIO* io = &p->io;
+  io->stream    = p->stdInput;
+  io->status    = PROC_IO_PENDING;
+
+  memset(&io->ov, 0, sizeof(io->ov));
+  io->ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+  if (!io->ov.hEvent) {
+    io->status = PROC_IO_ERROR;
+    return false;
+  }
+
+  DWORD n = 0;
+  if (WriteFile(p->stdInput, str, len, &n, &io->ov)) {
+    SetEvent(io->ov.hEvent);
+    return true;
+  }
+
+  DWORD err = GetLastError();
+  if (err == ERROR_IO_PENDING)
+    return true;
+
+  CloseHandle(io->ov.hEvent);
+  io->ov.hEvent = NULL;
+  io->status    = (err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA)
+                    ? PROC_IO_EOF
+                    : PROC_IO_ERROR;
+  return true;
+}
+
+u32 ProcessWait(Process* p) {
+  if (!p)
+    return -1;
+
+  ProcessIO* io = &p->io;
+
+  if (io->status == PROC_IO_EOF) {
+    if (io->ov.hEvent) {
+      CloseHandle(io->ov.hEvent);
+      io->ov.hEvent = NULL;
+    }
+    return 0;
+  }
+  if (io->status == PROC_IO_ERROR) {
+    if (io->ov.hEvent) {
+      CloseHandle(io->ov.hEvent);
+      io->ov.hEvent = NULL;
+    }
+    return -1;
+  }
+  if (!io->ov.hEvent) {
+    io->status = PROC_IO_ERROR;
+    return -1;
+  }
+
+  if (WaitForSingleObject(io->ov.hEvent, INFINITE) != WAIT_OBJECT_0) {
+    CancelIo(io->stream);
+    CloseHandle(io->ov.hEvent);
+    io->ov.hEvent = NULL;
+    io->status    = PROC_IO_ERROR;
+    return -1;
+  }
+
+  DWORD n  = 0;
+  BOOL  ok = GetOverlappedResult(io->stream, &io->ov, &n, FALSE);
+  CloseHandle(io->ov.hEvent);
+  io->ov.hEvent = NULL;
+
+  if (!ok) {
+    DWORD err  = GetLastError();
+    io->status = (err == ERROR_BROKEN_PIPE || err == ERROR_HANDLE_EOF)
+                   ? PROC_IO_EOF
+                   : PROC_IO_ERROR;
+    return io->status == PROC_IO_EOF ? 0 : -1;
+  }
+
+  io->status = PROC_IO_PENDING;
   return n;
 }
 
-i32 ProcessWrite(Process* p, const char* str, u32 len) {
-  if (!p || p->stdInput == INVALID_HANDLE_VALUE || !str || len == 0)
-    return -1;
-
-  DWORD total = 0;
-
-  while (len > 0) {
-    OVERLAPPED ov = { 0 };
-    DWORD      n  = 0;
-
-    if (!WriteFile(p->stdInput, (LPVOID)(str + total), len, &n, &ov)) {
-      DWORD err = GetLastError();
-      if (err == ERROR_IO_PENDING) {
-        if (!GetOverlappedResult(p->stdInput, &ov, &n, TRUE)) {
-          err = GetLastError();
-          if (err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA)
-            return total;
-          return -1;
-        }
-      } else if (err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA) {
-        return total;
-      } else {
-        return -1;
-      }
-    }
-
-    if (n == 0)
-      break;
-
-    total += n;
-    len -= n;
-  }
-
-  return total;
+bool ProcessCloseOnly(ProcessHandle h) {
+  if (!h || h == INVALID_HANDLE_VALUE)
+    return false;
+  bool ok = CloseHandle(h) != 0;
+  h       = INVALID_HANDLE_VALUE;
+  return ok;
 }
 
 bool ProcessClose(Process* p) {
   if (!p)
     return false;
 
-  if (p->stdInput != INVALID_HANDLE_VALUE && p->stdInput != NULL) {
-    CloseHandle(p->stdInput);
-    p->stdInput = INVALID_HANDLE_VALUE;
-  }
-  if (p->stdOutput != INVALID_HANDLE_VALUE && p->stdOutput != NULL) {
-    CloseHandle(p->stdOutput);
-    p->stdOutput = INVALID_HANDLE_VALUE;
-  }
-  if (p->stdError != INVALID_HANDLE_VALUE && p->stdError != NULL) {
-    CloseHandle(p->stdError);
-    p->stdError = INVALID_HANDLE_VALUE;
-  }
-  if (p->process != NULL) {
-    CloseHandle(p->process);
-    p->process = NULL;
-  }
-
-  return true;
+  return ProcessCloseOnly(p->stdInput) && ProcessCloseOnly(p->stdOutput)
+         && ProcessCloseOnly(p->stdError) && ProcessCloseOnly(p->process);
 }
 
 bool ProcessKill(Process* p) {
